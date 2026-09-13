@@ -18,7 +18,7 @@ class PodTests(unittest.TestCase):
 
         def handler(request):
             requests.append(request)
-            return httpx.Response(200, json={"ready": True})
+            return httpx.Response(200, json={"id": run_pod.MODEL})
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         with patch.object(run_pod.httpx, "Client", return_value=client):

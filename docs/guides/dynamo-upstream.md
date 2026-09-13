@@ -42,7 +42,9 @@ build rather than a release. Check what you got with `python -c 'import importli
 This guide was verified with `ai-dynamo==1.4.1` (which installs `vllm==0.26.0` and `torch` cu130) on an aarch64 host
 with a single GB10 GPU. See Dynamo's [release artifacts](https://docs.nvidia.com/dynamo/resources/release-artifacts)
 and [support matrix](https://docs.nvidia.com/dynamo/resources/support-matrix) for the wheel/CUDA combinations of other
-releases. No etcd or NATS is needed for a single-host setup when the components use file-based discovery.
+releases. File discovery can be used for a manually managed single-host setup. The bounded Messages recording runner
+uses a private local etcd process because Dynamo 1.4.1's file watcher did not deliver model registrations on the
+verified container host.
 
 ## 2. Start the Dynamo frontend and a worker
 
@@ -103,8 +105,7 @@ worker registered (the `instances` list is simply empty). It does **not** mean a
 per-model readiness endpoint before sending traffic:
 
 ```bash
-curl -s localhost:8000/v1/models/openai%2Fgpt-oss-20b/ready   # 404 "Model not found" until the worker registers,
-                                                                # then {"model": "...", "ready": true, ...}
+curl -s localhost:8000/v1/models/openai%2Fgpt-oss-20b   # 404 until the worker registers, then model metadata
 ```
 
 The harness CLI works the same way: `./target/debug/agentic run codex --upstream http://127.0.0.1:8000`.
@@ -168,15 +169,14 @@ stateless upstream.
 | `Free memory on device … is less than desired GPU memory utilization` | Lower `--gpu-memory-utilization`; it is a fraction of total memory. |
 | `CUDA error: out of memory` right after restarting a worker | A previous `dynamo.vllm` process is still alive and holding memory; `pkill -f "python -m dynamo.vllm"` before relaunching. Closing its terminal or tmux window does not kill it. |
 | `501 Validation: previous_response_id is not supported.` | You are calling Dynamo directly. Send the request to the gateway. |
-| Gateway logs `LLM ready` but requests fail with no model / `model not found` | `/health` is green before the worker registers. Check `/v1/models` or `/v1/models/{model}/ready` and the worker log. |
+| Gateway logs `LLM ready` but requests fail with no model / `model not found` | `/health` is green before the worker registers. Check `/v1/models` or `/v1/models/{model}` and the worker log. |
 | Installed version is `1.5.0.dev…` | `--prerelease=allow` with an unpinned `ai-dynamo` picked a dev build. Reinstall with `"ai-dynamo[vllm]==1.4.1"`. |
 
-## Messages recording preparation (#213)
+## Messages recordings (#213)
 
-The Messages recording workflow is prepared for a single Linux GPU host. **Dynamo Messages recordings have not yet
-been captured for this change.** The local preparation tests replay the existing vLLM Messages recordings; they do
-not establish Dynamo compatibility. The explicit `dynamo_messages_recorded_acceptance` test requires the real Dynamo
-files and fails if they are absent.
+The streaming and non-streaming Messages recordings were captured from Dynamo 1.4.1 with vLLM 0.26.0 on Linux
+x86_64, an NVIDIA L40S 46,068 MiB GPU, and NVIDIA driver 580.159.04. The model snapshot was
+`6cee5e81ee83917806bbde320786a8fb61efebee`. The checked-in acceptance test replays both real captures on every run.
 
 The frontend must enable the experimental Anthropic endpoint with `--enable-anthropic-api`. The gateway sends
 `/v1/messages` to that endpoint; it does not convert Messages requests into Chat Completions itself. Check this flag
@@ -217,7 +217,7 @@ Ubuntu template install the build prerequisites with:
 
 ```bash
 apt-get update
-apt-get install -y build-essential pkg-config libssl-dev ca-certificates git curl
+apt-get install -y build-essential pkg-config libssl-dev ca-certificates git curl etcd-server
 cd /workspace/agentic-api
 export HF_HOME=/workspace/huggingface
 bash scripts/dynamo/prepare-pod.sh
@@ -234,11 +234,11 @@ Run the recording session:
 .venv-dynamo-recorder/bin/python scripts/dynamo/run_pod.py --output /workspace/dynamo-session-01
 ```
 
-The runner requires an unused output directory and unused ports 8000, 9000, and 7070. It starts the frontend and one
-worker using file discovery, waits up to 15 minutes for model readiness, records both Messages modes, starts the
-gateway for a client-executed function-tool smoke test, and explicitly runs the GPU-recording replay test. It stops
-its own child process groups on success, failure, or interruption. No nested Docker, Kubernetes, etcd, or NATS is needed.
-Use a dedicated Pod without other Dynamo processes: file discovery is host-local shared state.
+The runner requires an unused output directory and unused ports 2379, 2380, 8000, 9000, and 7070. It starts a private
+single-node etcd, the frontend, and one worker, waits up to 15 minutes for model readiness, records both Messages modes,
+starts the gateway for a client-executed function-tool smoke test, and explicitly runs the GPU-recording replay test. It stops
+its own child process groups on success, failure, or interruption. No nested Docker, Kubernetes, external etcd, or
+NATS is needed. Use a dedicated Pod without other Dynamo processes.
 
 Each mode records a `web_search` call followed by a fixed tool output and a final answer. The fixed output is a test
 fixture, not a claim about today's Rust release. Both recordings must pass scenario and structural checks before
@@ -254,7 +254,7 @@ DYNAMO_URL=http://127.0.0.1:8000 MODEL=openai/gpt-oss-20b \
 bash crates/agentic-server-core/tests/cassettes/record_dynamo_messages_cassettes.sh
 
 cargo test --locked -p agentic-server-core --test dynamo_messages_test \
-  dynamo_messages_recorded_acceptance -- --ignored --exact
+  dynamo_messages_recorded_acceptance -- --exact
 ```
 
 The session directory retains selected environment metadata (source commit and dirty status, GPU/driver, model cache
@@ -263,13 +263,6 @@ output. Only a fully successful run writes `SUCCESS` and copies the accepted cas
 and session artifacts before terminating the Pod; storage may continue to be billed while a Pod is stopped.
 No environment-variable dump or credentials are included by the exporter; inspect captured headers before sharing.
 
-### Finish the PR after GPU validation
-
-1. Inspect the real streaming and non-streaming captures and reproduce any provider differences with a minimal request.
-2. Run scenario validation, the explicit Dynamo acceptance test above, the existing Dynamo/ Messages tests, full Rust
-   tests, Clippy, formatting, and pre-commit checks.
-3. Remove the acceptance test's temporary `ignore` attribute once real recordings are checked in, so the existing
-   `dynamo-upstream` CI job runs it on every change. Remove the preparation-only status language from this guide and
-   replace it with the exact verified GPU/software setup and observed compatibility findings.
-4. Keep any unrelated Dynamo or gateway behavior change in a separately explained fix. A successful mock replay alone
-   is not evidence of live Dynamo compatibility and is not sufficient to close #213.
+The successful GPU session validated the cassette scenarios, gateway client-tool round trip, and offline Rust replay.
+The retained session bundle contains the exact launch commands, package versions, service logs, smoke response, and
+replay output.

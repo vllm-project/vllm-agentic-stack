@@ -26,9 +26,9 @@ def wait_for_model(url, timeout):
     with httpx.Client(timeout=5) as client:
         while time.monotonic() < deadline:
             try:
-                response = client.get(f"{url}/v1/models/{quote(MODEL, safe='')}/ready",
+                response = client.get(f"{url}/v1/models/{quote(MODEL, safe='')}",
                                       timeout=min(5, max(0.01, deadline - time.monotonic())))
-                if response.status_code == 200 and response.json().get("ready") is True:
+                if response.status_code == 200 and response.json().get("id") == MODEL:
                     return
             except (httpx.HTTPError, ValueError):
                 pass
@@ -88,17 +88,25 @@ def main():
         parser.error("--ready-timeout must be positive")
     if shutil.disk_usage(ROOT).free < 30 * 1024**3:
         parser.error("need at least 30 GiB free after preparation")
-    for port in (8000, 9000, 7070):
+    for port in (2379, 2380, 8000, 9000, 7070):
         with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("127.0.0.1", port))
     # Exclusive session output prevents accidental overwrite or concurrent sessions.
     args.output.mkdir(parents=True, exist_ok=False)
+    child_env = dict(os.environ, ETCD_ENDPOINTS="http://127.0.0.1:2379")
     dynamo_python = ROOT / ".venv-dynamo/bin/python"
     commands = {
+        "etcd": ["etcd", "--data-dir", str(args.output / "etcd"),
+                 "--listen-client-urls", "http://127.0.0.1:2379",
+                 "--advertise-client-urls", "http://127.0.0.1:2379",
+                 "--listen-peer-urls", "http://127.0.0.1:2380",
+                 "--initial-advertise-peer-urls", "http://127.0.0.1:2380",
+                 "--initial-cluster", "default=http://127.0.0.1:2380"],
         "frontend": [str(dynamo_python), "-m", "dynamo.frontend", "--http-port", "8000",
-                     "--discovery-backend", "file", "--enable-anthropic-api"],
+                     "--discovery-backend", "etcd", "--enable-anthropic-api"],
         "worker": [str(dynamo_python), "-m", "dynamo.vllm", "--model", MODEL,
-                   "--discovery-backend", "file", "--kv-events-config", '{"enable_kv_cache_events":false}',
+                   "--discovery-backend", "etcd", "--kv-events-config", '{"enable_kv_cache_events":false}',
                    "--dyn-reasoning-parser", "gpt_oss", "--dyn-tool-call-parser", "harmony",
                    "--max-model-len", "8192", "--max-num-seqs", "1"],
         "gateway": [str(ROOT / "target/debug/agentic-server"), "--llm-api-base", "http://127.0.0.1:8000"],
@@ -119,7 +127,8 @@ def main():
     def start(name):
         log = (args.output / f"{name}.log").open("w")
         logs.append(log)
-        child = subprocess.Popen(commands[name], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        child = subprocess.Popen(commands[name], cwd=ROOT, env=child_env, stdout=log,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
         children.append(child)
 
     def run_owned(command, log, timeout, env=None):
@@ -135,15 +144,20 @@ def main():
 
     previous = signal.signal(signal.SIGTERM, interrupted)
     try:
+        start("etcd")
         start("frontend")
         start("worker")
         wait_for_model("http://127.0.0.1:8000", args.ready_timeout)
-        # Record exact downloaded revision rather than pretending the mutable name is pinned.
-        code = "from huggingface_hub import snapshot_download; print(snapshot_download('openai/gpt-oss-20b', local_files_only=True))"
-        snapshot = subprocess.check_output([str(dynamo_python), "-c", code], text=True).strip()
-        metadata["model_snapshot"] = snapshot
+        # Record the exact cached revision without requiring optional repository artifacts.
+        hf_home = Path(child_env.get("HF_HOME", Path.home() / ".cache/huggingface"))
+        model_cache = hf_home / "hub/models--openai--gpt-oss-20b"
+        revision = (model_cache / "refs/main").read_text().strip()
+        snapshot = model_cache / "snapshots" / revision
+        if not snapshot.is_dir():
+            raise RuntimeError(f"model snapshot does not exist: {snapshot}")
+        metadata["model_snapshot"] = str(snapshot)
         (args.output / "environment.json").write_text(json.dumps(metadata, indent=2))
-        env = dict(os.environ, PYTHON=sys.executable, MODEL=MODEL, DYNAMO_URL="http://127.0.0.1:8000")
+        env = dict(child_env, PYTHON=sys.executable, MODEL=MODEL, DYNAMO_URL="http://127.0.0.1:8000")
         with (args.output / "recording.log").open("w") as log:
             run_owned(["bash", "crates/agentic-server-core/tests/cassettes/record_dynamo_messages_cassettes.sh"],
                       log, 900, env)
@@ -162,7 +176,7 @@ def main():
         (args.output / "gateway-smoke.json").write_text(json.dumps(smoke("http://127.0.0.1:9000"), indent=2))
         with (args.output / "replay.log").open("w") as log:
             run_owned(["cargo", "test", "--locked", "-p", "agentic-server-core", "--test", "dynamo_messages_test",
-                       "dynamo_messages_recorded_acceptance", "--", "--ignored", "--exact"], log, 600)
+                       "dynamo_messages_recorded_acceptance", "--", "--exact"], log, 600)
         for path in (ROOT / "crates/agentic-server-core/tests/cassettes/dynamo").glob("dynamo-messages-*.yaml"):
             shutil.copy2(path, args.output)
         (args.output / "SUCCESS").write_text("Live recording, gateway smoke, and offline replay passed.\n")

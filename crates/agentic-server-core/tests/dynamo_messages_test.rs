@@ -1,5 +1,5 @@
-//! Provider-neutral preparation tests use existing vLLM recordings. The explicit
-//! GPU acceptance test requires real Dynamo recordings and never substitutes them.
+//! Provider-neutral tests use existing vLLM recordings. The Dynamo acceptance test
+//! replays the checked-in recordings captured from a real GPU-backed Dynamo worker.
 mod support;
 
 use std::future::Future;
@@ -178,7 +178,6 @@ async fn messages_replay_preparation_streaming() {
 }
 
 #[tokio::test]
-#[ignore = "requires real GPU recordings; run explicitly after record_dynamo_messages_cassettes.sh"]
 async fn dynamo_messages_recorded_acceptance() {
     for (suffix, streaming) in [("nonstreaming", false), ("streaming", true)] {
         replay(
