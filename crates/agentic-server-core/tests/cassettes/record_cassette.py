@@ -342,56 +342,83 @@ def _send_messages_nonstreaming(client: httpx.Client, body: dict, proxy_url: str
     return data
 
 
-def _send_messages_streaming(client: httpx.Client, body: dict, proxy_url: str) -> dict | None:
-    """Send an Anthropic Messages request (streaming) and reconstruct the final message.
-
-    Anthropic SSE sends the message envelope in `message_start`, then mutates it via
-    `content_block_start`/`content_block_delta`/`content_block_stop` and `message_delta`.
-    We accumulate those into the final message object so callers can chain the next turn.
-    """
-    message: dict | None = None
+def _send_messages_streaming(client: httpx.Client, body: dict, proxy_url: str) -> dict:
+    """Reconstruct a complete Messages response without repairing invalid captures."""
+    message = None
     blocks: dict[int, dict] = {}
+    active: set[int] = set()
+    stopped = False
     print("\n[Streaming message]")
     with client.stream("POST", f"{proxy_url}/v1/messages", json=body, timeout=300) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
-            if not line or not line.startswith("data:"):
+            if not line.startswith("data:"):
                 continue
             print(line)
-            try:
-                event = json.loads(line[5:].strip())
-            except Exception:
+            payload = line[5:].strip()
+            if payload == "[DONE]" and stopped:
                 continue
-            etype = event.get("type")
-            if etype == "message_start":
-                message = event.get("message", {})
-            elif etype == "content_block_start":
-                blocks[event["index"]] = event.get("content_block", {})
-            elif etype == "content_block_delta":
-                blk = blocks.setdefault(event["index"], {})
-                delta = event.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    blk["type"] = blk.get("type", "text")
-                    blk["text"] = blk.get("text", "") + delta.get("text", "")
-                elif delta.get("type") == "input_json_delta":
-                    blk["type"] = blk.get("type", "tool_use")
-                    blk["_partial_json"] = blk.get("_partial_json", "") + delta.get("partial_json", "")
-                elif delta.get("type") == "thinking_delta":
-                    blk["type"] = blk.get("type", "thinking")
-                    blk["thinking"] = blk.get("thinking", "") + delta.get("thinking", "")
-            elif etype == "message_delta" and message is not None:
-                message.update({k: v for k, v in event.get("delta", {}).items()})
+            event = json.loads(payload)
+            kind = event.get("type")
+            if kind == "ping":
+                continue
+            if stopped:
+                raise ValueError("Messages event after message_stop")
+            if kind == "error":
+                raise ValueError("Messages upstream returned an error event")
+            if kind == "message_start":
+                if message is not None:
+                    raise ValueError("duplicate message_start")
+                message = event["message"].copy()
+                continue
+            if message is None:
+                raise ValueError("Messages event before message_start")
+            if kind == "content_block_start":
+                index = event["index"]
+                if type(index) is not int or index != len(blocks):
+                    raise ValueError("invalid or repeated content block index")
+                blocks[index] = event["content_block"].copy()
+                active.add(index)
+            elif kind == "content_block_delta":
+                index = event["index"]
+                if index not in active:
+                    raise ValueError("delta outside active content block")
+                block = blocks[index]
+                delta = event["delta"]
+                field = {
+                    "text_delta": ("text", "text", "text"),
+                    "thinking_delta": ("thinking", "thinking", "thinking"),
+                    "signature_delta": ("thinking", "signature", "signature"),
+                    "input_json_delta": ("tool_use", "_partial_json", "partial_json"),
+                }.get(delta.get("type"))
+                if field is None or block.get("type") != field[0]:
+                    raise ValueError("unsupported or wrong-kind Messages delta")
+                block[field[1]] = block.get(field[1], "") + delta[field[2]]
+            elif kind == "content_block_stop":
+                index = event["index"]
+                if index not in active:
+                    raise ValueError("completion outside active content block")
+                block = blocks[index]
+                if "_partial_json" in block:
+                    block["input"] = json.loads(block.pop("_partial_json"))
+                if block.get("type") == "tool_use" and not isinstance(block.get("input"), dict):
+                    raise ValueError("tool input must be a JSON object")
+                active.remove(index)
+            elif kind == "message_delta":
+                if active:
+                    raise ValueError("message_delta before content block completion")
+                message.update(event["delta"])
+                message.setdefault("usage", {}).update(event.get("usage", {}))
+            elif kind == "message_stop":
+                if active or not message.get("stop_reason"):
+                    raise ValueError("incomplete message_stop")
+                stopped = True
+            else:
+                raise ValueError(f"unsupported Messages event: {kind}")
+    if not stopped or message is None:
+        raise ValueError("Messages stream ended without message_stop")
     print()
-    if message is not None:
-        # Finalize accumulated tool_use input from partial JSON.
-        for blk in blocks.values():
-            if blk.get("type") == "tool_use" and "_partial_json" in blk:
-                raw = blk.pop("_partial_json")
-                try:
-                    blk["input"] = json.loads(raw) if raw else {}
-                except Exception:
-                    blk["input"] = {}
-        message["content"] = [blocks[i] for i in sorted(blocks)]
+    message["content"] = list(blocks.values())
     return message
 
 
